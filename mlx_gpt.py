@@ -1,9 +1,13 @@
+import math
+import os
+import time
 from dataclasses import dataclass
+from functools import partial
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
-
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_map, tree_reduce
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -171,24 +175,178 @@ class GPT(nn.Module):
             x = mx.concatenate([x, xcol], axis=1)
         return x
 
+# -----------------------------------------------------------------------------
+import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32)
+    ptt = mx.array(npt, dtype=mx.uint32)
+    return ptt
+
+class DataLoaderLite:
+    def __init__(self, B, T, split):
+        self.B = B
+        self.T = T
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        data_root = "idwiki"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).reshape(B, T) # inputs
+        y = (buf[1:]).reshape(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T
+        return x, y
 
 if __name__ == '__main__':
-    import tiktoken
     mx.random.seed(1234)
+
+    enc = tiktoken.get_encoding('gpt2')
+
+    total_batch_size = 4096
+    B = 4 # micro batch size
+    T = 512 # sequence length
+    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+    train_loader = DataLoaderLite(B=B, T=T, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, split="val")
+
     model = GPT.from_pretrained('gpt2')
     nparams = sum(
         x.size for k, x in tree_flatten(model.parameters()) if "embedding" not in k
     )
     print(f"number of params: {nparams / 1000**2:.3f} M")
-    num_return_sequences = 5
-    max_length = 30
-    k = 50
-    enc = tiktoken.get_encoding('gpt2')
-    tokens = enc.encode("I'm a language model,")
-    x = mx.array(tokens)
-    x = mx.repeat(x[None,:], repeats=num_return_sequences, axis=0)
-    x = model.generate(x, max_length)
-    for i in range(num_return_sequences):
-        tokens = x[i, :max_length].tolist()
-        decoded = enc.decode(tokens)
-        print(">", decoded)
+    # use bfloat16 to save memory
+    model.apply(lambda x: x.astype(mx.bfloat16))
+
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 200
+    max_steps = 20000
+    eval_steps = 250
+    save_steps = 5000
+    def get_lr(it):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_steps:
+            return max_lr * (it+1) / warmup_steps
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > max_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (max_lr - min_lr)
+
+    def loss_fn(model, x, y, reduce=True):
+        logits = model(x)
+        losses = nn.losses.cross_entropy(logits, y)
+        return mx.mean(losses) if reduce else mx.mean(losses, axis=(-1, -2))
+
+    # optimize!
+    optimizer = optim.AdamW(learning_rate=3e-4, betas=[0.9, 0.95], eps=1e-8)
+
+    state = [model.state, optimizer.state]
+
+    # create the log directory we will write checkpoints to and log to
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log.txt")
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
+
+    def eval_fn():
+        val_loader.reset()
+        val_loss_accum = 0.0
+        val_loss_steps = 20
+        for _ in range(val_loss_steps):
+            x, y = val_loader.next_batch()
+            loss = loss_fn(model, x, y, reduce=False)
+            loss = loss / val_loss_steps
+            val_loss_accum += loss
+        return val_loss_accum
+
+    for step in range(max_steps):
+        last_step = (step == max_steps - 1)
+
+        # once in a while evaluate our validation loss
+        if step % eval_steps == 0 or last_step:
+            val_loss_accum = eval_fn()
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % save_steps == 0 or last_step):
+                # optionally write model checkpoints
+                model_path = os.path.join(log_dir, f"model_{step:05d}.safetensors")
+                weights = tree_flatten(model.trainable_parameters())
+                mx.save_safetensors(str(model_path), dict(weights))
+
+        # once in a while generate from the model (except step 0, which is noise)
+        if ((step > 0 and step % eval_steps == 0) or last_step):
+            num_return_sequences = 4
+            max_length = 32
+            k = 50
+            tokens = enc.encode("Jakarta adalah")
+            x = mx.array(tokens)
+            x = mx.repeat(x[None,:], repeats=num_return_sequences, axis=0)
+            x = model.generate(x, max_length)
+            for i in range(num_return_sequences):
+                tokens = x[i, :max_length].tolist()
+                decoded = enc.decode(tokens)
+                print(">", decoded)
+
+        t0 = time.time()
+        lr = get_lr(step)
+        optimizer.learning_rate = lr
+        accum_grads = tree_map(
+            lambda x: mx.zeros_like(x), model.parameters()
+        )
+        accum_loss = 0
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            loss, grads = loss_and_grad_fn(model, x, y)
+            accum_grads = tree_map(
+                lambda acc, new: acc + new * (1.0 / grad_accum_steps),
+                accum_grads,
+                grads,
+            )
+            accum_loss += loss
+        loss = accum_loss / grad_accum_steps
+        clipped_grads, _ = optim.clip_grad_norm(accum_grads, 1.0)
+        optimizer.update(model, clipped_grads)
+        mx.eval(state, loss)
+        t1 = time.time()
+        dt = t1 - t0 # time difference in seconds
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+        tokens_per_sec = tokens_processed / dt
+        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss.item():.6f}\n")
