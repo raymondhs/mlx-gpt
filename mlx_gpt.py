@@ -79,9 +79,8 @@ class GPT(nn.Module):
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.h = [Block(config) for _ in range(config.n_layer)]
         self.ln_f = nn.LayerNorm(config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def __call__(self, idx, targets=None):
+    def __call__(self, idx):
         # idx is of shape (B, T)
         B, T = idx.shape
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -99,11 +98,9 @@ class GPT(nn.Module):
             x = block(x, mask)
         # forward the final layernorm and the classifier
         x = self.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        loss = None
-        if targets is not None:
-            loss = nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
-        return logits, loss
+        # weight sharing scheme
+        logits = self.wte.as_linear(x) # (B, T, vocab_size)
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -135,6 +132,7 @@ class GPT(nn.Module):
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        sd_keys_hf = [k for k in sd_keys_hf if not k.startswith('lm_head')]
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k_hf in sd_keys_hf:
@@ -153,7 +151,7 @@ class GPT(nn.Module):
     def generate(self, x, max_length=30):
         while x.shape[1] < max_length:
             # forward the model to get the logits
-            logits, _ = model(x) # (B, T, vocab_size)
+            logits = model(x) # (B, T, vocab_size)
             # take the logits at the last position
             logits = logits[:, -1, :] # (B, vocab_size)
             # get the probabilities
@@ -178,6 +176,10 @@ if __name__ == '__main__':
     import tiktoken
     mx.random.seed(1234)
     model = GPT.from_pretrained('gpt2')
+    nparams = sum(
+        x.size for k, x in tree_flatten(model.parameters()) if "embedding" not in k
+    )
+    print(f"number of params: {nparams / 1000**2:.3f} M")
     num_return_sequences = 5
     max_length = 30
     k = 50
@@ -185,7 +187,7 @@ if __name__ == '__main__':
     tokens = enc.encode("I'm a language model,")
     x = mx.array(tokens)
     x = mx.repeat(x[None,:], repeats=num_return_sequences, axis=0)
-    x = model.generate(x)
+    x = model.generate(x, max_length)
     for i in range(num_return_sequences):
         tokens = x[i, :max_length].tolist()
         decoded = enc.decode(tokens)
