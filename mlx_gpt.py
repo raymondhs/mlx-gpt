@@ -152,10 +152,10 @@ class GPT(nn.Module):
         model.load_weights(list(sd.items()))
         return model
 
-    def generate(self, x, max_length=30):
+    def generate(self, x, max_length=30, k=50):
         while x.shape[1] < max_length:
             # forward the model to get the logits
-            logits = model(x) # (B, T, vocab_size)
+            logits = self(x) # (B, T, vocab_size)
             # take the logits at the last position
             logits = logits[:, -1, :] # (B, vocab_size)
             # get the probabilities
@@ -338,6 +338,10 @@ if __name__ == '__main__':
                 accum_grads,
                 grads,
             )
+            tree_map(
+                lambda grad: mx.eval(grad),
+                accum_grads,
+            )
             accum_loss += loss
         loss = accum_loss / grad_accum_steps
         clipped_grads, _ = optim.clip_grad_norm(accum_grads, 1.0)
@@ -347,6 +351,7 @@ if __name__ == '__main__':
         dt = t1 - t0 # time difference in seconds
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
         tokens_per_sec = tokens_processed / dt
-        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        peak_mem = mx.metal.get_peak_memory() / 2**30
+        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | peak mem: {peak_mem:.3f} GB")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss.item():.6f}\n")
