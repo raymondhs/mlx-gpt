@@ -227,9 +227,9 @@ if __name__ == '__main__':
 
     enc = tiktoken.get_encoding('gpt2')
 
-    total_batch_size = 4096
-    B = 4 # micro batch size
-    T = 512 # sequence length
+    total_batch_size = 512 * 1024
+    B = 8 # micro batch size
+    T = 1024 # sequence length
     assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
     grad_accum_steps = total_batch_size // (B * T)
     print(f"total desired batch size: {total_batch_size}")
@@ -248,10 +248,10 @@ if __name__ == '__main__':
 
     max_lr = 6e-4
     min_lr = max_lr * 0.1
-    warmup_steps = 200
-    max_steps = 20000
-    eval_steps = 250
-    save_steps = 5000
+    max_steps = 800 # roughly 1 epoch
+    warmup_steps = 0.1 * max_steps
+    eval_steps = 50
+    save_steps = 200
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_steps:
@@ -293,6 +293,7 @@ if __name__ == '__main__':
             val_loss_accum += loss
         return val_loss_accum
 
+    start_time = time.time()
     for step in range(max_steps):
         last_step = (step == max_steps - 1)
 
@@ -349,9 +350,15 @@ if __name__ == '__main__':
         mx.eval(state, loss)
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
+        elapsed_time = t1 - start_time
+        remaining_steps = max_steps - (step + 1)
+        eta = (elapsed_time / (step + 1)) * remaining_steps
+        eta_h = int(eta // 3600)
+        eta_m = int((eta % 3600) // 60)
+        eta_s = int(eta % 60)
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
         tokens_per_sec = tokens_processed / dt
         peak_mem = mx.metal.get_peak_memory() / 2**30
-        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | peak mem: {peak_mem:.3f} GB")
+        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | peak mem: {peak_mem:.3f} GB | ETA: {eta_h}h{eta_m}m{eta_s}s")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss.item():.6f}\n")
