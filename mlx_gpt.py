@@ -2,7 +2,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from functools import partial
+from transformers import AutoTokenizer
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
@@ -225,9 +225,9 @@ class DataLoaderLite:
 if __name__ == '__main__':
     mx.random.seed(1234)
 
-    enc = tiktoken.get_encoding('gpt2')
+    enc = AutoTokenizer.from_pretrained("./indonesian-wikipedia-tokenizer")
 
-    total_batch_size = 512 * 1024
+    total_batch_size = 16 * 1024
     B = 8 # micro batch size
     T = 1024 # sequence length
     assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
@@ -238,7 +238,7 @@ if __name__ == '__main__':
     train_loader = DataLoaderLite(B=B, T=T, split="train")
     val_loader = DataLoaderLite(B=B, T=T, split="val")
 
-    model = GPT.from_pretrained('gpt2')
+    model = GPT(GPTConfig())
     nparams = sum(
         x.size for k, x in tree_flatten(model.parameters()) if "embedding" not in k
     )
@@ -248,10 +248,10 @@ if __name__ == '__main__':
 
     max_lr = 6e-4
     min_lr = max_lr * 0.1
-    max_steps = 800 # roughly 1 epoch
-    warmup_steps = 0.1 * max_steps
-    eval_steps = 50
-    save_steps = 200
+    max_steps = 13696 # 13,696 steps is ~1 epoch, if data is 224M tokens and batch size 16K tokens
+    warmup_steps = 513
+    eval_steps = 200
+    save_steps = 4000
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_steps:
@@ -314,7 +314,7 @@ if __name__ == '__main__':
             num_return_sequences = 4
             max_length = 32
             k = 50
-            tokens = enc.encode("Jakarta adalah")
+            tokens = enc.encode("Kota Semarang adalah")
             x = mx.array(tokens)
             x = mx.repeat(x[None,:], repeats=num_return_sequences, axis=0)
             x = model.generate(x, max_length)
@@ -359,6 +359,6 @@ if __name__ == '__main__':
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
         tokens_per_sec = tokens_processed / dt
         peak_mem = mx.metal.get_peak_memory() / 2**30
-        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | peak mem: {peak_mem:.3f} GB | ETA: {eta_h}h{eta_m}m{eta_s}s")
+        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | peak mem: {peak_mem:.3f} GB | eta: {eta_h}h{eta_m}m{eta_s}s")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss.item():.6f}\n")

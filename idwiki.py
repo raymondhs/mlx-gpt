@@ -10,13 +10,15 @@ Will save shards to the local directory "idwiki".
 import os
 import multiprocessing as mp
 import numpy as np
-import tiktoken
+from transformers import AutoTokenizer # use custom tokenizer
+from transformers.utils import logging
+logging.set_verbosity(40) # turn off long sequence warning
 from datasets import load_dataset # pip install datasets
 from tqdm import tqdm # pip install tqdm
 
 # ------------------------------------------
 local_dir = "idwiki"
-shard_size = int(5e6) # 5M tokens per shard, total of 79 shards
+shard_size = int(5e6) # 5M tokens per shard, total of 45 shards
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname('.'), local_dir)
@@ -26,14 +28,14 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 fw = load_dataset("wikimedia/wikipedia", "20231101.id", split="train")
 
 # init the tokenizer
-enc = tiktoken.get_encoding("gpt2")
-eot = enc._special_tokens['<|endoftext|>'] # end of text token
+enc = AutoTokenizer.from_pretrained('./indonesian-wikipedia-tokenizer')
+eot = enc.eos_token_id
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
     tokens = [eot] # the special <|endoftext|> token delimits all documents
     text = doc['title'] + '\n' + doc['text']
     text = text.replace('\n\n', '\n')
-    tokens.extend(enc.encode_ordinary(text))
+    tokens.extend(enc.encode(text, add_special_tokens=False))
     tokens_np = np.array(tokens)
     assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
     tokens_np_uint16 = tokens_np.astype(np.uint16)
@@ -51,6 +53,7 @@ if __name__ == '__main__':
         all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
         token_count = 0
         progress_bar = None
+        total_tokens = 0
         for tokens in pool.imap(tokenize, fw, chunksize=16):
 
             # is there enough space in the current shard for the new tokens?
@@ -71,6 +74,7 @@ if __name__ == '__main__':
                 progress_bar.update(remainder)
                 all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
                 write_datafile(filename, all_tokens_np)
+                total_tokens += token_count + remainder
                 shard_index += 1
                 progress_bar = None
                 # populate the next shard with the leftovers of the current doc
@@ -82,3 +86,5 @@ if __name__ == '__main__':
             split = "val" if shard_index == 0 else "train"
             filename = os.path.join(DATA_CACHE_DIR, f"idwiki_{split}_{shard_index:06d}")
             write_datafile(filename, all_tokens_np[:token_count])
+            total_tokens += token_count
+        print(f"Total tokens: {total_tokens}")
