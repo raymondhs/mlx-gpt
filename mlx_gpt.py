@@ -192,7 +192,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "idwiki"
+        data_root = "idcorpus"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
@@ -227,7 +227,7 @@ if __name__ == '__main__':
 
     enc = AutoTokenizer.from_pretrained("./indonesian-wikipedia-tokenizer")
 
-    total_batch_size = 16 * 1024
+    total_batch_size = 256 * 1024
     B = 8 # micro batch size
     T = 1024 # sequence length
     assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
@@ -246,12 +246,12 @@ if __name__ == '__main__':
     # use bfloat16 to save memory
     model.apply(lambda x: x.astype(mx.bfloat16))
 
-    max_lr = 6e-4
+    max_lr = 1e-3
     min_lr = max_lr * 0.1
-    max_steps = 13696 # 13,696 steps is ~1 epoch, if data is 224M tokens and batch size 16K tokens
-    warmup_steps = 513
-    eval_steps = 200
-    save_steps = 4000
+    max_steps = 4875 # ~1 epoch, if data is 1.3B tokens and batch size 256K tokens
+    warmup_steps = 182
+    eval_steps = 50
+    save_steps = 1000
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_steps:
@@ -271,7 +271,7 @@ if __name__ == '__main__':
         return mx.mean(losses) if reduce else mx.mean(losses, axis=(-1, -2))
 
     # optimize!
-    optimizer = optim.AdamW(learning_rate=3e-4, betas=[0.9, 0.95], eps=1e-8)
+    optimizer = optim.AdamW(learning_rate=3e-4, betas=[0.9, 0.95], eps=1e-8, weight_decay=0.1)
 
     state = [model.state, optimizer.state]
 

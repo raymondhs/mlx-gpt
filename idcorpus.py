@@ -1,10 +1,11 @@
 """
-Indonesian Wikipedia dataset
+Indonesian Wikipedia and C4 dataset
 https://huggingface.co/datasets/wikimedia/wikipedia
+https://huggingface.co/datasets/allenai/c4
 Downloads and tokenizes the data and saves data shards to disk.
 Run simply as:
-$ python idwiki.py
-Will save shards to the local directory "idwiki".
+$ python idcorpus.py
+Will save shards to the local directory "idcorpus".
 """
 
 import os
@@ -13,19 +14,23 @@ import numpy as np
 from transformers import AutoTokenizer # use custom tokenizer
 from transformers.utils import logging
 logging.set_verbosity(40) # turn off long sequence warning
-from datasets import load_dataset # pip install datasets
+from datasets import load_dataset, concatenate_datasets # pip install datasets
 from tqdm import tqdm # pip install tqdm
 
 # ------------------------------------------
-local_dir = "idwiki"
-shard_size = int(5e6) # 5M tokens per shard, total of 45 shards
+local_dir = "idcorpus"
+shard_size = int(1e8) # 100M tokens per shard
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname('.'), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset
-fw = load_dataset("wikimedia/wikipedia", "20231101.id", split="train")
+wiki = load_dataset("wikimedia/wikipedia", "20231101.id", split="train")
+wiki = wiki.remove_columns(["id", "url", "title"])
+c4 = load_dataset("indonesian-nlp/mc4-id", "tiny", split="train", trust_remote_code=True)
+c4 = c4.remove_columns(["url", "timestamp"])
+fw = concatenate_datasets([wiki, c4]).shuffle(seed=42)
 
 # init the tokenizer
 enc = AutoTokenizer.from_pretrained('./indonesian-wikipedia-tokenizer')
@@ -33,9 +38,7 @@ eot = enc.eos_token_id
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
     tokens = [eot] # the special <|endoftext|> token delimits all documents
-    text = doc['title'] + '\n' + doc['text']
-    text = text.replace('\n\n', '\n')
-    tokens.extend(enc.encode(text, add_special_tokens=False))
+    tokens.extend(enc.encode(doc['text'], add_special_tokens=False))
     tokens_np = np.array(tokens)
     assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
     tokens_np_uint16 = tokens_np.astype(np.uint16)
